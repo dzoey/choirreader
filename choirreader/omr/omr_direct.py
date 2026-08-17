@@ -4,9 +4,18 @@ Bypasses Audiveris' MusicXML export which has two major bugs:
 1. Flattens chords — ~98% of detected chord groupings are lost
 2. Inverts pitches for multi-notehead chords (87-97% across our test pages)
 
-The internal .omr file has the correct notehead positions, chord groupings,
-voice assignments, and rhythm. This module reads that data and constructs
-MusicXML from scratch with correct pitches, chords, and rhythm.
+The internal .omr file has correct data:
+- Notehead y-coordinates (visual positions)
+- Chord groupings (multi-notehead chords)
+- Voice assignments (soprano/alto/tenor/bass)
+- Rhythm via slot time-offsets (fractional whole notes)
+
+This module reads that data and constructs MusicXML with correct pitches,
+chords, and rhythm.
+
+Key insight: Audiveris uses slot time-offsets like "1/8", "3/4", "1/2" etc.
+to represent time positions within a measure. These are fractions of a whole
+note. Duration = (next_BEGIN_slot_time - current_slot_time) * 4 * divisions.
 """
 
 from __future__ import annotations
@@ -14,6 +23,7 @@ from __future__ import annotations
 import logging
 import zipfile
 from dataclasses import dataclass, field
+from fractions import Fraction
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -22,12 +32,11 @@ from ..correction.pitch import _get_staff_lines
 
 log = logging.getLogger("choirreader.omr.omr_direct")
 
-DIVISIONS = 4
+DIVISIONS = 4  # divisions per quarter note
 
 
 @dataclass
 class Notehead:
-    """A single notehead in the .omr file."""
     id: int
     staff: int
     omr_pitch: int
@@ -39,7 +48,6 @@ class Notehead:
 
 @dataclass
 class Chord:
-    """A chord (one or more noteheads on a stem)."""
     id: int
     staff: int
     x: float
@@ -92,10 +100,6 @@ BASS_NOTE_TABLE = [
 
 
 def _fine_step_to_diatonic(step: float, clef: str, fifths: int) -> tuple[str, int, int]:
-    """Convert step to (step_letter, octave, alter).
-
-    alter: -1 for flat, 0 for natural, +1 for sharp.
-    """
     table = TREBLE_NOTE_TABLE if clef == "G_CLEF" else BASS_NOTE_TABLE
     best = None
     best_diff = float('inf')
@@ -112,8 +116,64 @@ def _fine_step_to_diatonic(step: float, clef: str, fifths: int) -> tuple[str, in
     alter = 0
     if note == "B" and fifths <= -1:
         alter = -1
-
     return note, octave, alter
+
+
+def _parse_time_offset(s: str) -> Fraction:
+    """Parse a time-offset string like '1/4', '3/8', '1/16' into a Fraction."""
+    s = s.strip()
+    if '/' in s:
+        num, den = s.split('/')
+        return Fraction(int(num), int(den))
+    return Fraction(int(s))
+
+
+def _build_slot_time_map(root: ET.Element) -> dict[int, dict[int, Fraction]]:
+    """Build a mapping of stack_id -> {slot_id -> time-offset fraction}.
+
+    Each stack represents a measure. Its slots have time-offsets that are
+    fractions of a whole note (e.g., 1/4 = quarter note from start of measure).
+    """
+    stack_map = {}
+    for stack in root.iter('stack'):
+        sid = int(stack.get('id'))
+        slots = {}
+        for slot in stack.findall('slot'):
+            slot_id = int(slot.get('id'))
+            time_str = slot.get('time-offset', '0')
+            slots[slot_id] = _parse_time_offset(time_str)
+        stack_map[sid] = slots
+    return stack_map
+
+
+def _infer_time_sig_from_stacks(root: ET.Element) -> tuple[int, int]:
+    """Infer the time signature from the most common stack duration."""
+    durations = []
+    for stack in root.iter('stack'):
+        d = stack.get('duration', '1')
+        durations.append(_parse_time_offset(d))
+    if not durations:
+        return 4, 4
+    # Most common duration
+    from collections import Counter
+    most_common = Counter(durations).most_common(1)[0][0]
+    # Convert Fraction to time signature
+    # 3/4 = 3/4, 2/4 = 1/2 (whole notes), 4/4 = 1, 6/8 = 3/4 (whole notes)
+    if most_common == Fraction(1):
+        return 4, 4
+    elif most_common == Fraction(3, 4):
+        return 3, 4
+    elif most_common == Fraction(1, 2):
+        return 2, 4
+    elif most_common == Fraction(3, 8):
+        return 6, 8
+    elif most_common == Fraction(1, 4):
+        return 1, 4
+    else:
+        # Try to find a simple fraction
+        num = most_common.numerator
+        den = most_common.denominator
+        return num, den
 
 
 def parse_omr(omr_path: Path) -> Score:
@@ -124,12 +184,15 @@ def parse_omr(omr_path: Path) -> Score:
     score = Score()
     staff_lines = pitch._get_staff_lines(root)
 
+    # Key signature
     for k in root.iter("key"):
         fifths = k.get("fifths")
         if fifths is not None:
             score.key_fifths = int(fifths)
             break
 
+    # Time signature - prefer explicit time-pair, else infer from stacks
+    found_time = False
     for m in root.iter("measure"):
         times_ref = m.find("times")
         if times_ref is not None and times_ref.text:
@@ -139,9 +202,14 @@ def parse_omr(omr_path: Path) -> Score:
                     rational = tp.get("time-rational", "3/4")
                     num, den = rational.split("/")
                     score.time_sig = (int(num), int(den))
+                    found_time = True
                     break
             break
 
+    if not found_time:
+        score.time_sig = _infer_time_sig_from_stacks(root)
+
+    # Clefs
     for c in root.iter("clef"):
         shape = c.get("shape", "")
         staff = c.get("staff")
@@ -155,6 +223,7 @@ def parse_omr(omr_path: Path) -> Score:
             default_clef = "G_CLEF" if sid % 2 == 1 else "F_CLEF"
             score.staves[sid] = StaffData(staff_id=sid, clef=default_clef)
 
+    # Noteheads
     noteheads_by_staff: dict[int, list[Notehead]] = {}
     for head in root.iter("head"):
         hid = int(head.get("id"))
@@ -175,6 +244,7 @@ def parse_omr(omr_path: Path) -> Score:
         )
         noteheads_by_staff.setdefault(staff, []).append(nh)
 
+    # Chords
     for hc in root.iter("head-chord"):
         cid = int(hc.get("id"))
         staff = int(hc.get("staff"))
@@ -194,6 +264,10 @@ def parse_omr(omr_path: Path) -> Score:
             chord.noteheads.append(nh)
         score.staves[staff].chords[cid] = chord
 
+    # Build slot time map
+    slot_time_map = _build_slot_time_map(root)
+
+    # Measures
     for m in root.iter("measure"):
         mid = int(m.get("id"))
         hc_ref = m.find("head-chords")
@@ -208,7 +282,40 @@ def parse_omr(omr_path: Path) -> Score:
         if measure_staff is None:
             continue
 
+        # Get this measure's stack index (measure IDs restart per staff)
+        # Actually the stack ID is the same as the measure ID for the first staff
+        # For subsequent staves, the stack ID might be different
+        # For simplicity, use the measure's own stack (stacks are per-staff)
         measure_data = {"id": mid, "voices": {}}
+
+        # Find the right stack for this measure
+        # Stacks are in order, so we need to figure out which stack corresponds to this measure
+        # The slot keys in this measure should match a stack's slot IDs
+        # For simplicity, we'll find the stack whose slot IDs match
+        stack_id = None
+        for voice in m.findall("voice"):
+            slots_elem = voice.find("slots")
+            if slots_elem is None:
+                continue
+            for entry in slots_elem.findall("entry"):
+                key_elem = entry.find("key")
+                if key_elem is not None:
+                    key_val = int(key_elem.text)
+                    # Find which stack has this slot id
+                    for sid_test, slots in slot_time_map.items():
+                        if key_val in slots:
+                            stack_id = sid_test
+                            break
+                    break
+            if stack_id is not None:
+                break
+
+        # Use the matched stack's time map, or default to 1/key
+        if stack_id is not None:
+            time_map = slot_time_map[stack_id]
+        else:
+            time_map = None
+
         for voice in m.findall("voice"):
             vid = int(voice.get("id"))
             slots = []
@@ -222,7 +329,18 @@ def parse_omr(omr_path: Path) -> Score:
                         chord_id = int(value_elem.get("chord"))
                         status = value_elem.get("status", "BEGIN")
                         if chord_id in score.staves[measure_staff].chords:
-                            slots.append({"key": key_val, "chord_id": chord_id, "status": status})
+                            # Convert slot key to time-offset
+                            if time_map and key_val in time_map:
+                                time_offset = time_map[key_val]
+                            else:
+                                # Fallback: assume each key = 1 quarter note
+                                time_offset = Fraction(key_val, 4) if key_val else Fraction(0)
+                            slots.append({
+                                "key": key_val,
+                                "chord_id": chord_id,
+                                "status": status,
+                                "time_offset": time_offset,
+                            })
             measure_data["voices"][vid] = slots
 
         score.staves[measure_staff].measures.append(measure_data)
@@ -239,12 +357,19 @@ def parse_omr(omr_path: Path) -> Score:
 
 
 def _slot_to_type(duration_divisions: int) -> str:
+    """Convert duration in divisions to a MusicXML note type."""
     if duration_divisions >= 16:
         return "whole"
+    elif duration_divisions >= 12:
+        return "dotted-half"
     elif duration_divisions >= 8:
         return "half"
+    elif duration_divisions >= 6:
+        return "dotted-quarter"
     elif duration_divisions >= 4:
         return "quarter"
+    elif duration_divisions >= 3:
+        return "dotted-eighth"
     elif duration_divisions >= 2:
         return "eighth"
     elif duration_divisions >= 1:
@@ -252,18 +377,44 @@ def _slot_to_type(duration_divisions: int) -> str:
     return "quarter"
 
 
-def _build_part_from_staff(score: Score, staff_id: int, part_id: str) -> ET.Element:
-    sdata = score.staves[staff_id]
+def _group_staff_pairs(staff_ids: list[int]) -> list[tuple[int, int]]:
+    sorted_staves = sorted(staff_ids)
+    pairs = []
+    for i in range(0, len(sorted_staves), 2):
+        if i + 1 < len(sorted_staves):
+            pairs.append((sorted_staves[i], sorted_staves[i + 1]))
+        else:
+            pairs.append((sorted_staves[i], None))
+    return pairs
+
+
+def _build_part_from_staves(
+    score: Score,
+    treble_staff_ids: list[int],
+    bass_staff_ids: list[int],
+    part_id: str,
+    part_name: str,
+    clef: str,
+    time_num: int,
+    time_den: int,
+) -> ET.Element:
     part = ET.Element("part")
     part.set("id", part_id)
 
-    clef_sign = "G" if sdata.clef == "G_CLEF" else "F"
-    clef_line = "2" if sdata.clef == "G_CLEF" else "4"
+    clef_sign = "G" if clef == "G_CLEF" else "F"
+    clef_line = "2" if clef == "G_CLEF" else "4"
 
-    all_measures = sdata.measures
-    time_num = score.time_sig[0]
+    all_measures = []
+    for staff_id in treble_staff_ids + bass_staff_ids:
+        sdata = score.staves[staff_id]
+        for m in sdata.measures:
+            all_measures.append((staff_id, m))
 
-    for measure_idx, measure in enumerate(all_measures, start=1):
+    # Total duration of the time signature in whole notes
+    total_whole_notes = Fraction(time_num, time_den) * Fraction(1, 4)
+
+    for measure_idx, (staff_id, measure) in enumerate(all_measures, start=1):
+        sdata = score.staves[staff_id]
         m_xml = ET.SubElement(part, "measure")
         m_xml.set("number", str(measure_idx))
 
@@ -281,21 +432,26 @@ def _build_part_from_staff(score: Score, staff_id: int, part_id: str) -> ET.Elem
             line.text = clef_line
             time = ET.SubElement(attrs, "time")
             beats = ET.SubElement(time, "beats")
-            beats.text = str(score.time_sig[0])
+            beats.text = str(time_num)
             bt = ET.SubElement(time, "beat-type")
-            bt.text = str(score.time_sig[1])
+            bt.text = str(time_den)
 
         for voice_id in sorted(measure["voices"].keys()):
             voice_slots = measure["voices"][voice_id]
             if voice_slots:
-                _emit_slots(m_xml, voice_slots, sdata, score, staff_id, voice_id, time_num)
+                _emit_slots(m_xml, voice_slots, sdata, score, staff_id, voice_id, total_whole_notes)
 
     return part
 
 
 def _emit_slots(measure_xml: ET.Element, slots: list[dict], sdata: StaffData,
-                 score: Score, staff_id: int, voice_id: int, time_num: int) -> None:
-    sorted_slots = sorted(slots, key=lambda s: s["key"] if s["key"] is not None else 0)
+                 score: Score, staff_id: int, voice_id: int, total_whole_notes: Fraction) -> None:
+    """Emit MusicXML notes from a list of slots using time-offset fractions.
+
+    Duration = (next_BEGIN_slot_time - current_slot_time) * 4 * DIVISIONS
+    where 4 converts whole notes to quarter notes.
+    """
+    sorted_slots = sorted(slots, key=lambda s: s["time_offset"])
     begin_indices = [
         i for i, s in enumerate(sorted_slots)
         if s["status"] == "BEGIN"
@@ -308,17 +464,20 @@ def _emit_slots(measure_xml: ET.Element, slots: list[dict], sdata: StaffData,
         if chord is None or not chord.noteheads:
             continue
 
-        current_key = slot["key"]
+        current_time = slot["time_offset"]
         if idx_pos + 1 < len(begin_indices):
             next_begin = sorted_slots[begin_indices[idx_pos + 1]]
-            next_key = next_begin["key"]
+            next_time = next_begin["time_offset"]
         else:
-            next_key = time_num + 1
+            next_time = total_whole_notes
 
-        if next_key is None or next_key <= current_key:
-            duration_div = DIVISIONS
-        else:
-            duration_div = (next_key - current_key) * DIVISIONS
+        # Duration in divisions = (next - current) * 4 * DIVISIONS
+        # (4 converts whole notes to quarter notes, DIVISIONS converts to divisions)
+        duration_whole = next_time - current_time
+        duration_div = int(duration_whole * 4 * DIVISIONS)
+
+        if duration_div <= 0:
+            duration_div = DIVISIONS  # default to quarter
 
         noteheads = sorted(chord.noteheads, key=lambda n: n.cy)
 
@@ -360,34 +519,48 @@ def _emit_note(measure_xml: ET.Element, notehead: Notehead, score: Score,
 
 
 def generate_musicxml(score: Score) -> str:
+    """Generate a MusicXML string with two parts (treble + bass)."""
     root = ET.Element("score-partwise")
     root.set("version", "4.0")
 
-    part_list = ET.SubElement(root, "part-list")
-    score_part = ET.SubElement(part_list, "score-part")
-    score_part.set("id", "P1")
-    part_name = ET.SubElement(score_part, "part-name")
-    part_name.text = "Music"
+    staff_ids = sorted(score.staves.keys())
+    pairs = _group_staff_pairs(staff_ids)
 
-    for i, staff_id in enumerate(sorted(score.staves.keys()), start=1):
-        part_xml = _build_part_from_staff(score, staff_id, f"P{i}")
-        root.append(part_xml)
+    treble_staves = [p[0] for p in pairs]
+    bass_staves = [p[1] for p in pairs if p[1] is not None]
+
+    part_list = ET.SubElement(root, "part-list")
+    sp1 = ET.SubElement(part_list, "score-part")
+    sp1.set("id", "P1")
+    ET.SubElement(sp1, "part-name").text = "Treble"
+    sp2 = ET.SubElement(part_list, "score-part")
+    sp2.set("id", "P2")
+    ET.SubElement(sp2, "part-name").text = "Bass"
+
+    time_num, time_den = score.time_sig
+
+    treble_part = _build_part_from_staves(
+        score, treble_staves, [], "P1", "Treble", "G_CLEF",
+        time_num, time_den,
+    )
+    root.append(treble_part)
+
+    if bass_staves:
+        bass_part = _build_part_from_staves(
+            score, [], bass_staves, "P2", "Bass", "F_CLEF",
+            time_num, time_den,
+        )
+        root.append(bass_part)
 
     ET.indent(root, space="  ")
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode")
 
 
 def convert_omr_to_musicxml(omr_path: Path, output_path: Path) -> dict:
-    """Convert an .omr file to MusicXML.
-
-    If the output_path ends in .mxl, the result is compressed into a ZIP
-    with META-INF/container.xml. Otherwise, raw XML is written.
-    """
     score = parse_omr(omr_path)
     xml_str = generate_musicxml(score)
 
     if str(output_path).endswith(".mxl"):
-        # Compress into .mxl (ZIP) format
         with zipfile.ZipFile(output_path, "w", zipfile.ZIP_DEFLATED) as z:
             z.writestr("score.xml", xml_str)
             container_xml = (
