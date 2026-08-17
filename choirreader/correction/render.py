@@ -53,16 +53,30 @@ def _render_lilypond(musicxml_path: Path, output_png: Path) -> Path:
         raise RenderError("musicxml2ly not found (part of Lilypond).")
     output_png.parent.mkdir(parents=True, exist_ok=True)
     ly = output_png.with_suffix(".ly")
-    subprocess.run(
-        [m2l, "-o", str(ly), str(musicxml_path)],
-        check=True, capture_output=True, timeout=120,
-    )
+    try:
+        subprocess.run(
+            [m2l, "-o", str(ly), str(musicxml_path)],
+            check=True, capture_output=True, timeout=120,
+        )
+    except subprocess.CalledProcessError as e:
+        # musicxml2ly is fragile on imperfect OMR output (e.g. a note with no
+        # clef context). Surface as a RenderError so the loop can skip cleanly.
+        raise RenderError(
+            f"musicxml2ly failed on {musicxml_path.name}: "
+            f"{e.stderr[-300:] if e.stderr else e}"
+        ) from e
     # Render to PNG. Lilypond names output <stem>-1.png, <stem>-2.png, ...
-    subprocess.run(
-        [bin_, "--png", "-dno-gs-load-fonts", "-dinclude-eps-fonts",
-         "-o", str(output_png.parent / ly.stem), str(ly)],
-        check=True, capture_output=True, timeout=300,
-    )
+    try:
+        subprocess.run(
+            [bin_, "--png", "-dno-gs-load-fonts", "-dinclude-eps-fonts",
+             "-o", str(output_png.parent / ly.stem), str(ly)],
+            check=True, capture_output=True, timeout=300,
+        )
+    except subprocess.CalledProcessError as e:
+        raise RenderError(
+            f"lilypond failed on {ly.name}: "
+            f"{e.stderr[-300:] if e.stderr else e}"
+        ) from e
     produced = sorted(output_png.parent.glob(f"{ly.stem}-*.png"))
     if not produced:
         produced = sorted(output_png.parent.glob(f"{ly.stem}.png"))

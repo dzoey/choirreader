@@ -16,7 +16,7 @@ from pathlib import Path
 
 from ..config import Config
 from ..omr import get_backend
-from . import apply, render, vision
+from . import apply, render, sanitize, vision
 
 log = logging.getLogger("choirreader.correction.loop")
 
@@ -42,6 +42,12 @@ def transcribe_pdf(pdf_path: Path, output_dir: Path, config: Config) -> list[Cor
     results: list[CorrectionResult] = []
     for i, mxl in enumerate(mxl_files, start=1):
         res = CorrectionResult(i, mxl)
+        # Sanitize OMR output (e.g. add missing clefs) before rendering, so
+        # downstream tools like musicxml2ly don't crash on malformed input.
+        try:
+            sanitize.sanitize(mxl)
+        except Exception as e:  # noqa: BLE001 — sanitize is best-effort
+            log.warning("Sanitize failed on %s: %s", mxl.name, e)
         if config.vision_model and config.max_iterations > 0:
             _run_correction_loop(mxl, pdf_path, i, config, res)
         results.append(res)
