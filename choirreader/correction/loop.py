@@ -16,7 +16,7 @@ from pathlib import Path
 
 from ..config import Config
 from ..omr import get_backend
-from . import apply, render, sanitize, vision
+from . import apply, render, rhythm, sanitize, vision
 
 log = logging.getLogger("choirreader.correction.loop")
 
@@ -48,6 +48,18 @@ def transcribe_pdf(pdf_path: Path, output_dir: Path, config: Config) -> list[Cor
             sanitize.sanitize(mxl)
         except Exception as e:  # noqa: BLE001 — sanitize is best-effort
             log.warning("Sanitize failed on %s: %s", mxl.name, e)
+        # Normalize measure durations to the time signature so the staves
+        # stay aligned (Audiveris misreads note durations, causing drift).
+        try:
+            rsum = rhythm.normalize(mxl)
+            if rsum.get("measures_fixed"):
+                log.info(
+                    "Rhythm normalized %s: %d measures fixed, %d notes trimmed, %d rests added",
+                    mxl.name, rsum["measures_fixed"],
+                    rsum["notes_trimmed"], rsum["rests_added"],
+                )
+        except Exception as e:  # noqa: BLE001 — normalization is best-effort
+            log.warning("Rhythm normalization failed on %s: %s", mxl.name, e)
         if config.vision_model and config.max_iterations > 0:
             _run_correction_loop(mxl, pdf_path, i, config, res)
         results.append(res)
