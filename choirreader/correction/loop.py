@@ -16,7 +16,7 @@ from pathlib import Path
 
 from ..config import Config
 from ..omr import get_backend
-from . import apply, render, rhythm, sanitize, vision
+from . import apply, pitch_fix, render, rhythm, sanitize, vision
 
 log = logging.getLogger("choirreader.correction.loop")
 
@@ -60,6 +60,20 @@ def transcribe_pdf(pdf_path: Path, output_dir: Path, config: Config) -> list[Cor
                 )
         except Exception as e:  # noqa: BLE001 — normalization is best-effort
             log.warning("Rhythm normalization failed on %s: %s", mxl.name, e)
+        # Fix pitches using .omr y-coordinates. Audiveris systematically inverts
+        # pitches for multi-notehead chords; we recompute them from the staff
+        # positions which are correct.
+        omr_path = mxl.with_suffix(".omr")
+        if omr_path.exists():
+            try:
+                psum = pitch_fix.fix_pitches_from_omr(mxl, omr_path)
+                if psum.get("fixed"):
+                    log.info(
+                        "Pitch fix on %s: %d notes corrected",
+                        mxl.name, psum["fixed"],
+                    )
+            except Exception as e:  # noqa: BLE001 — pitch fix is best-effort
+                log.warning("Pitch fix failed on %s: %s", mxl.name, e)
         if config.vision_model and config.max_iterations > 0:
             _run_correction_loop(mxl, pdf_path, i, config, res)
         results.append(res)
