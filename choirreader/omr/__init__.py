@@ -11,7 +11,6 @@ import abc
 import logging
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
 
@@ -41,12 +40,25 @@ class OMRBackend(abc.ABC):
 
 
 class AudiverisBackend(OMRBackend):
-    """Audiveris OMR engine (best free OMR; already installed on this box)."""
+    """Audiveris OMR engine.
+
+    Runs Audiveris to produce its internal ``.omr`` file (which has correct
+    notehead positions, chord groupings, voice assignments, and rhythm), then
+    converts that directly to MusicXML — bypassing Audiveris' MusicXML export
+    which has two major bugs:
+
+    1. Flattens chords — ~98% of detected chord groupings are lost
+    2. Inverts pitches for multi-notehead chords (87-97% across our test pages)
+
+    Set ``use_omr_direct=False`` in the constructor to fall back to Audiveris'
+    own MusicXML export (not recommended).
+    """
 
     name = "audiveris"
 
-    def __init__(self, binary: str = "audiveris"):
+    def __init__(self, binary: str = "audiveris", use_omr_direct: bool = True):
         self.binary = binary
+        self.use_omr_direct = use_omr_direct
 
     def is_available(self) -> bool:
         return shutil.which(self.binary) is not None
@@ -60,8 +72,7 @@ class AudiverisBackend(OMRBackend):
 
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Audiveris can take a PDF directly, but page-by-page PNG gives us
-        # cleaner per-page control and matches how we render for comparison.
+        # Render PDF to PNG (with defensive downscaling for Audiveris' 20M-pixel cap)
         pages = _pdf_to_pngs(pdf_path, output_dir / "_pages")
 
         results: list[Path] = []
@@ -69,11 +80,12 @@ class AudiverisBackend(OMRBackend):
         for i, page in enumerate(pages, start=1):
             page_out = output_dir / f"page_{i:03d}"
             page_out.mkdir(parents=True, exist_ok=True)
+
+            # Run Audiveris to produce the .omr file (regardless of which output we use)
             cmd = [
                 self.binary,
                 "-batch",
                 "-transcribe",
-                "-export",
                 "-output",
                 str(page_out),
                 str(page),
@@ -82,15 +94,19 @@ class AudiverisBackend(OMRBackend):
                 cmd, capture_output=True, text=True, timeout=600
             )
             if proc.returncode != 0:
-                # A single bad page (blank, title page, too-large image) should
-                # not abort the whole run — log and continue.
                 failures.append(
                     f"page {i} ({page.name}): {proc.stderr[-300:].strip()}"
                 )
                 continue
-            mxl = _find_mxl(page_out)
+
+            if self.use_omr_direct:
+                # Convert .omr directly to MusicXML (bypasses export bugs)
+                mxl = self._convert_omr_to_musicxml(page_out)
+            else:
+                # Use Audiveris' own MusicXML export (legacy, has bugs)
+                mxl = _find_mxl(page_out)
+
             if mxl is None:
-                # Audiveris may skip non-music pages; that's not fatal.
                 failures.append(f"page {i} ({page.name}): no MusicXML produced")
                 continue
             results.append(mxl)
@@ -106,6 +122,28 @@ class AudiverisBackend(OMRBackend):
                 len(failures), pdf_path.name, "\n".join(failures),
             )
         return results
+
+    def _convert_omr_to_musicxml(self, page_out: Path) -> Path | None:
+        """Convert an .omr file to MusicXML using the direct parser."""
+        omr_files = list(page_out.glob("*.omr"))
+        if not omr_files:
+            log.warning("No .omr file found in %s", page_out)
+            return None
+
+        omr_file = omr_files[0]
+        mxl_output = page_out / f"{omr_file.stem}.mxl"
+
+        try:
+            from .omr_direct import convert_omr_to_musicxml
+            stats = convert_omr_to_musicxml(omr_file, mxl_output)
+            log.info(
+                "OMR-direct converted %s: %d staves, %d measures, %d chords",
+                omr_file.name, stats["staves"], stats["measures"], stats["chords_emitted"],
+            )
+            return mxl_output
+        except Exception as e:
+            log.warning("OMR-direct conversion failed for %s: %s", omr_file, e)
+            return None
 
 
 def _pdf_to_pngs(pdf_path: Path, out_dir: Path) -> list[Path]:
@@ -149,5 +187,8 @@ def _find_mxl(directory: Path) -> Path | None:
 def get_backend(name: str, config) -> OMRBackend:
     """Factory: return the OMR backend for a given name."""
     if name == "audiveris":
-        return AudiverisBackend(binary=config.audiveris_bin)
+        return AudiverisBackend(
+            binary=config.audiveris_bin,
+            use_omr_direct=getattr(config, "use_omr_direct", True),
+        )
     raise OMRError(f"Unknown OMR backend: {name!r}")
