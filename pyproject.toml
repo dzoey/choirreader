@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "choirreader"
+version = "0.1.0"
+description = "OMR for choral sheet music with an AI-assisted correction loop"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "music21>=9.1",
+    "flask>=3.0",
+    "requests>=2.31",
+    "pypdf>=4.0",
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+choirreader = "choirreader.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["choirreader*"]

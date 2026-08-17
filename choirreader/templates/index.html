@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ChoirReader</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+    h1 { font-size: 1.6rem; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1.5rem; margin: 1rem 0; }
+    label { display: block; margin: 0.5rem 0 0.25rem; font-weight: 600; }
+    input[type=file], input[type=number] { width: 100%; padding: 0.4rem; margin-bottom: 0.75rem; }
+    button { background: #2563eb; color: #fff; border: none; padding: 0.6rem 1.2rem; border-radius: 6px; font-size: 1rem; cursor: pointer; }
+    button:disabled { background: #9ca3af; cursor: not-allowed; }
+    #status { margin-top: 1rem; white-space: pre-wrap; font-family: monospace; font-size: 0.9rem; }
+    .error { color: #b91c1c; }
+    a.dl { display: inline-block; margin-right: 1rem; color: #2563eb; }
+  </style>
+</head>
+<body>
+  <h1>ChoirReader</h1>
+  <p>Upload a PDF of sheet music. It will be OCR'd to MusicXML, then a vision
+     model compares the result against the original and fixes discrepancies.</p>
+
+  <div class="card">
+    <label for="file">Sheet music PDF</label>
+    <input type="file" id="file" accept=".pdf">
+
+    <label for="max_iterations">Correction iterations</label>
+    <input type="number" id="max_iterations" value="3" min="0" max="10">
+
+    <button id="go">Transcribe</button>
+  </div>
+
+  <div id="status"></div>
+
+  <script>
+    const go = document.getElementById('go');
+    const statusEl = document.getElementById('status');
+
+    go.addEventListener('click', async () => {
+      const file = document.getElementById('file').files[0];
+      if (!file) { statusEl.textContent = 'Please choose a PDF first.'; return; }
+
+      const form = new FormData();
+      form.append('file', file);
+      form.append('max_iterations', document.getElementById('max_iterations').value);
+
+      go.disabled = true;
+      statusEl.textContent = 'Uploading…';
+
+      try {
+        const resp = await fetch('/api/transcribe', { method: 'POST', body: form });
+        const data = await resp.json();
+        if (!resp.ok) { throw new Error(data.error || 'upload failed'); }
+        poll(data.job_id);
+      } catch (e) {
+        statusEl.textContent = 'Error: ' + e.message;
+        statusEl.classList.add('error');
+        go.disabled = false;
+      }
+    });
+
+    async function poll(jobId) {
+      const resp = await fetch('/api/status/' + jobId);
+      const job = await resp.json();
+      if (job.status === 'running') {
+        statusEl.textContent = 'Processing… (this can take a few minutes per page)';
+        setTimeout(() => poll(jobId), 2000);
+      } else if (job.status === 'done') {
+        statusEl.classList.remove('error');
+        let html = 'Done! Downloads:\n';
+        for (const r of job.results) {
+          html += `\nPage ${r.page} (${r.corrections} corrections):\n`;
+          html += `  <a class="dl" href="/api/download/${jobId}/${r.musicxml}">${r.musicxml}</a>`;
+          html += `  <a class="dl" href="/api/download/${jobId}/${r.midi}">${r.midi}</a>\n`;
+        }
+        statusEl.innerHTML = html;
+        go.disabled = false;
+      } else {
+        statusEl.textContent = 'Error: ' + (job.error || 'unknown');
+        statusEl.classList.add('error');
+        go.disabled = false;
+      }
+    }
+  </script>
+</body>
+</html>
